@@ -67,6 +67,9 @@ public class NebulaSession implements Serializable {
         parameterMap.forEach((key, value) -> map.put(key.getBytes(), Session.value2Nvalue(value)));
         return new ResultSet(connection.executeWithParameter(sessionID, stmt, map), timezoneOffset);
     }
+    public String executeJson(String stmt) throws IOErrorException {
+       return connection.executeJson(sessionID, stmt);
+    }
 
     public void release() {
         try {
