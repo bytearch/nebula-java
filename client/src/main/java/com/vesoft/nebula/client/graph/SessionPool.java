@@ -8,6 +8,8 @@ package com.vesoft.nebula.client.graph;
 import static com.vesoft.nebula.client.graph.exception.IOErrorException.E_CONNECT_BROKEN;
 
 import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.JSONObject;
 import com.vesoft.nebula.ErrorCode;
 import com.vesoft.nebula.client.graph.data.HostAddress;
 import com.vesoft.nebula.client.graph.data.ResultSet;
@@ -19,14 +21,18 @@ import com.vesoft.nebula.client.graph.net.AuthResult;
 import com.vesoft.nebula.client.graph.net.SessionState;
 import com.vesoft.nebula.client.graph.net.SyncConnection;
 import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+
+import com.vesoft.nebula.util.NebulaConstant;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -196,6 +202,93 @@ public class SessionPool implements Serializable {
         return resultSet;
     }
 
+
+    /**
+     * Execute the nGql sentence.
+     *
+     * @param sql The nGql sentence.
+     *             such as insert ngql `INSERT VERTEX person(name) VALUES "Tom":("Tom");`
+     * @return The ResultSet
+     */
+    public JSONObject executeJson(String sql) throws IOErrorException,
+             AuthFailedException, BindSpaceFailedException {
+        long t1 = System.currentTimeMillis();
+        stmtCheck(sql);
+        checkSessionPool();
+        NebulaSession nebulaSession = null;
+        JSONObject restJson = new JSONObject();
+        int tryTimes = 0;
+        while (tryTimes++ <= retryTimes) {
+            try {
+                nebulaSession = getSession();
+                JSONObject jsonObject = JSON.parseObject(Objects.requireNonNull(nebulaSession.executeJson(sql)));
+                JSONObject errors = jsonObject.getJSONArray(NebulaConstant.NebulaJson.ERRORS.getKey()).getJSONObject(0);
+                restJson.put(NebulaConstant.NebulaJson.CODE.getKey(), errors.getInteger(NebulaConstant.NebulaJson.CODE.getKey()));
+                if (errors.getInteger(NebulaConstant.NebulaJson.CODE.getKey()) != 0) {
+                    //not success
+                    restJson.put(NebulaConstant.NebulaJson.MESSAGE.getKey(), errors.getString(NebulaConstant.NebulaJson.MESSAGE.getKey()));
+                    log.error("get json result error:{}",restJson);
+                    nebulaSession.release();
+                    sessionList.remove(nebulaSession);
+                } else {
+                    //success
+                    releaseSession(nebulaSession);
+
+                    JSONObject results = jsonObject.getJSONArray(NebulaConstant.NebulaJson.RESULTS.getKey()).getJSONObject(0);
+                    JSONArray columns = results.getJSONArray(NebulaConstant.NebulaJson.COLUMNS.getKey());
+                    if (Objects.isNull(columns)) {
+                        return restJson;
+                    }
+                    JSONArray data = results.getJSONArray(NebulaConstant.NebulaJson.DATA.getKey());
+                    if (Objects.isNull(data)) {
+                        return restJson;
+                    }
+                    List<JSONObject> resultList = new ArrayList<>();
+                    data.stream().map(d -> (JSONObject) d).forEach(d -> {
+                        JSONArray row = d.getJSONArray(NebulaConstant.NebulaJson.ROW.getKey());
+                        JSONObject map = new JSONObject();
+                        for (int i = 0; i < columns.size(); i++) {
+                            map.put(columns.getString(i), row.get(i));
+                        }
+                        resultList.add(map);
+                    });
+                    restJson.put(NebulaConstant.NebulaJson.DATA.getKey(), resultList);
+                    log.info("nebula execute success! retry:{} sql:{} cost:{} ms", tryTimes,  sql, System.currentTimeMillis() - t1);
+                    return restJson;
+                }
+                try {
+                    Thread.sleep(intervalTime);
+                } catch (InterruptedException interruptedException) {
+                    // ignore
+                }
+            } catch (ClientServerIncompatibleException e) {
+                // will never get here.
+            } catch (AuthFailedException | BindSpaceFailedException e) {
+                throw e;
+            } catch (IOErrorException e) {
+                if (nebulaSession != null) {
+                    nebulaSession.release();
+                    sessionList.remove(nebulaSession);
+                }
+                if (tryTimes < retryTimes) {
+                    log.warn(String.format("execute failed for IOErrorException, message: %s, "
+                            + "retry: %d", e.getMessage(), tryTimes));
+                    try {
+                        Thread.sleep(intervalTime);
+                    } catch (InterruptedException interruptedException) {
+                        // ignore
+                    }
+                } else {
+                    throw e;
+                }
+            }
+        }
+        if (nebulaSession != null) {
+            nebulaSession.release();
+            sessionList.remove(nebulaSession);
+        }
+        return restJson;
+    }
 
     /**
      * Execute the nGql sentence with parameter
